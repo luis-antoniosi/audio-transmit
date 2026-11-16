@@ -1,0 +1,6 @@
+- Ring buffers
+- Sockets
+- https://github.com/mackron/miniaudio/discussions/639
+
+- Make connected DGRAM
+- https://beej.us/guide/bgnet/html/split/client-server-background.html#datagram
