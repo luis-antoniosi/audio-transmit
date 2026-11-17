@@ -1,17 +1,33 @@
-#define MINIAUDIO_IMPLEMENTATION
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    typedef SOCKET socket_t;
 
+    #define PRINT_SOCK_ERROR(msg) fprintf(stderr, "%s: %d\n", msg, WSAGetLastError())
+    #define CLOSE_SOCKET(s) closesocket(s)
+#elif __unix__
+    #include <sys/types.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    typedef int socket_t;
+
+    #define INVALID_SOCKET (-1)
+    #define PRINT_SOCK_ERROR(msg) perror(msg)
+    #define CLOSE_SOCKET(s) close(s)
+    #define SOCKET_ERROR (-1)
+#endif
+
+#define MINIAUDIO_IMPLEMENTATION
 #include <stdio.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include "miniaudio.h"
 
 #define FORMAT ma_format_f32
 #define CHANNELS 2
 #define SAMPLE_RATE 48000
 #define FRAMES_PER_PACKET 256
+#define MAX_PACKET_BYTES 32768 // 4096 * 8
 
 #define PORT "6969"
 
@@ -39,17 +55,29 @@ void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uin
     (void)pInput;
 }
 
-void *get_in_addr(struct sockaddr *sa)
-{
-    if (sa->sa_family == AF_INET)
-        return &(((struct sockaddr_in*)sa)->sin_addr);
+// void *get_in_addr(struct sockaddr *sa)
+// {
+//     if (sa->sa_family == AF_INET)
+//         return &(((struct sockaddr_in*)sa)->sin_addr);
 
-    return &(((struct sockaddr_in6*)sa)->sin6_addr);
-}
+//     return &(((struct sockaddr_in6*)sa)->sin6_addr);
+// }
 
 int main()
 {
-    int sockfd = -1, numBytes = -1, rv = -1;
+    int returnCode = -1;
+
+    #ifdef _WIN32
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+        {
+            fprintf(stderr, "WSAStartup failed.\n");
+            return returnCode;
+        }
+    #endif
+
+    socket_t sockfd = INVALID_SOCKET; 
+    int numBytes = -1, rv = -1;
     struct addrinfo hints, *servInfo, *p;
     
     memset(&hints, 0, sizeof(hints));
@@ -60,21 +88,22 @@ int main()
     if ((rv = getaddrinfo(NULL, PORT, &hints, &servInfo)) != 0)
     {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-        return 1;
+        returnCode = -1;
+        goto cleanup_info;
     }
 
     for (p = servInfo; p != NULL; p = p->ai_next)
     {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
+        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == INVALID_SOCKET)
         {
-            perror("listener: socket");
+            PRINT_SOCK_ERROR("listener: socket");
             continue;
         }
 
-        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1)
+        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == SOCKET_ERROR)
         {
-            close(sockfd);
-            perror("listener: bind");
+            CLOSE_SOCKET(sockfd);
+            PRINT_SOCK_ERROR("listener: bind");
             continue;
         }
 
@@ -84,37 +113,51 @@ int main()
     if (p == NULL)
     {
         fprintf(stderr, "listener: failed to bind socket\n");
-        return 1;
+        returnCode = -1;
+        goto cleanup_sock;
     }
 
-    freeaddrinfo(servInfo);
-
-    char buf[BUF_LEN];
     printf("Listening on port: %s\n", PORT);
 
     ma_context context;
     if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS)
-        return -1;
+    {
+        fprintf(stderr, "listener: failed to initialize context.\n");
+        returnCode = -1;
+        goto cleanup_context;
+    }
 
-    ma_device_info* pPlaybackInfos;
-    ma_uint32 playbackCount;
+    ma_device_info* pPlaybackInfos = NULL;
+    ma_uint32 playbackCount = -1;
 
     if (ma_context_get_devices(&context, &pPlaybackInfos, &playbackCount, NULL, NULL) != MA_SUCCESS)
-        return -1;
+    {
+        fprintf(stderr, "listener: failed to get context devices.\n");
+        returnCode = -1;
+        goto cleanup_context;
+    }
 
     for (ma_uint32 iDevice = 0; iDevice < playbackCount; iDevice++)
         printf("Playback: %d - %s\n", iDevice, pPlaybackInfos[iDevice].name);
 
     printf("Choose an id: ");
     int chosenID = -1;
-    scanf("%d", &chosenID);
+    if ((scanf("%d", &chosenID) != 1) || chosenID < 0 || (ma_uint32)chosenID >= playbackCount)
+    {
+        fprintf(stderr, "listener: invalid device ID.\n");
+        returnCode = -1;
+        goto cleanup_context;
+    }
 
-    if (chosenID < 0 || chosenID >= playbackCount)
-        return -1;
+    printf("Chosen: %d\n", chosenID);
 
     ma_pcm_rb rb;
     if (ma_pcm_rb_init(FORMAT, CHANNELS, SAMPLE_RATE, NULL, NULL, &rb) != MA_SUCCESS)
-        return -1;
+    {
+        fprintf(stderr, "listener: failed to initialize ring buffer.\n");
+        returnCode = -1;
+        goto cleanup_rb;
+    }  
 
     ma_device_config config = ma_device_config_init(ma_device_type_playback);
     config.playback.format = FORMAT;
@@ -127,45 +170,72 @@ int main()
     ma_device device;
     if (ma_device_init(&context, &config, &device) != MA_SUCCESS)
     {
-        fprintf(stderr, "Failed to initialize playback device.\n");
-        return -2;
+        fprintf(stderr, "talker: failed to initialize playback device.\n");
+        returnCode = -2;
+        goto cleanup_device;
     }
 
     if (ma_device_start(&device) != MA_SUCCESS)
     {
-        ma_device_uninit(&device);
-        fprintf(stderr, "Failed to start playback device.\n");
-        return -2;
+        fprintf(stderr, "talker: failed to start playback device.\n");
+        returnCode = -2;
+        goto cleanup_device;
     }
 
+    char recvBuf[MAX_PACKET_BYTES];
+    size_t bytesPerFrame = ma_get_bytes_per_frame(FORMAT, CHANNELS);
     while (1)
     {
-        void *pBuffer;
-        ma_uint32 framesToWrite = FRAMES_PER_PACKET;
+        struct sockaddr_storage addr;
+        socklen_t addrLen = sizeof(addr);
 
-        if (ma_pcm_rb_acquire_write(&rb, &framesToWrite, &pBuffer) == MA_SUCCESS
-            && framesToWrite > 0)
+        if ((numBytes = recvfrom(sockfd, recvBuf, sizeof(recvBuf), 0, (struct sockaddr *)&addr, &addrLen)) == SOCKET_ERROR)
         {
-            size_t maxBytes = framesToWrite * ma_get_bytes_per_frame(FORMAT, CHANNELS);
+            PRINT_SOCK_ERROR("recvfrom");
+            break;
+        }
 
-            struct sockaddr_storage addr;
-            socklen_t addr_len = sizeof(addr);
-            if ((numBytes = recvfrom(sockfd, pBuffer, maxBytes, 0, (struct sockaddr *)&addr, &addr_len)) == -1)
+        ma_uint32 framesRemaining = (ma_uint32)(numBytes / bytesPerFrame);
+        const char *srcPtr = recvBuf;
+
+        while (framesRemaining > 0)
+        {
+            void *pBuffer;
+            ma_uint32 framesToWrite = framesRemaining;
+
+            if (ma_pcm_rb_acquire_write(&rb, &framesToWrite, &pBuffer) == MA_SUCCESS
+                && framesToWrite > 0)
             {
-                perror("recvfrom");
-                ma_pcm_rb_commit_write(&rb, 0);
+                size_t bytesToCopy = framesToWrite * bytesPerFrame;
+                memcpy(pBuffer, srcPtr, bytesToCopy);
+                ma_pcm_rb_commit_write(&rb, framesToWrite);
+                
+                srcPtr += bytesToCopy;
+                framesRemaining -= framesToWrite;
+            }    
+            else
                 break;
-            }
-
-            ma_uint32 framesReceived = numBytes / ma_get_bytes_per_frame(FORMAT, CHANNELS);
-            ma_pcm_rb_commit_write(&rb, framesReceived);
-        }    
+        }
     }
     
-    ma_context_uninit(&context);
-    ma_device_uninit(&device);
-    ma_pcm_rb_uninit(&rb);
-    close(sockfd);
+    returnCode = 0;
 
-    return 0;
+    cleanup:
+    cleanup_device:
+        ma_device_uninit(&device);
+    cleanup_rb:
+        ma_pcm_rb_uninit(&rb);
+    cleanup_context:
+        ma_context_uninit(&context);
+    cleanup_sock:
+        CLOSE_SOCKET(sockfd);
+    cleanup_info:
+        if (servInfo)
+            freeaddrinfo(servInfo); 
+
+    #ifdef _WIN32
+        WSACleanup();
+    #endif
+
+    return returnCode;
 }
